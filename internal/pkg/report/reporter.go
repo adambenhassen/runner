@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// maxDynamicSteps caps the number of reusable-workflow steps allocated per task
+// to bound memory and the reported TaskState size. Far above any realistic
+// reusable-workflow step count.
+const maxDynamicSteps = 5000
 
 type Reporter struct {
 	ctx    context.Context
@@ -44,13 +50,24 @@ type Reporter struct {
 	// so the gauge skips no-op Set calls when the buffer size is unchanged.
 	lastLogBufferRows int
 
-	state             *runnerv1.TaskState
-	stateChanged      bool
-	stateMu           sync.RWMutex
-	outputs           sync.Map
-	daemon            chan struct{}
-	heartbeatStop     chan struct{}
-	heartbeatStopOnce sync.Once
+	state *runnerv1.TaskState
+	// preSeededSteps is the number of steps the task itself declares (the value
+	// passed to ResetSteps). Steps with a lower stepNumber are indexed directly;
+	// steps at or beyond it come from a called (workflow_call) reusable workflow
+	// and are allocated dynamically.
+	preSeededSteps int
+	// dynStepIndex maps a reusable-workflow inner step (keyed by jobID and
+	// stepNumber) to its flat index in state.Steps.
+	dynStepIndex map[string]int
+	// One-shot guards so the warnings below are logged at most once per task.
+	dynOverflowLogged  bool
+	jobIDMissingLogged bool
+	stateChanged       bool
+	stateMu            sync.RWMutex
+	outputs            sync.Map
+	daemon             chan struct{}
+	heartbeatStop      chan struct{}
+	heartbeatStopOnce  sync.Once
 
 	// Unix-nanos of the last successful UpdateTask. Atomic so the heartbeat
 	// guard in ReportState reads it without contending stateMu.
@@ -122,11 +139,62 @@ func (r *Reporter) Result() runnerv1.Result {
 func (r *Reporter) ResetSteps(l int) {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
+	r.preSeededSteps = l
+	r.dynStepIndex = make(map[string]int)
 	for i := range l {
 		r.state.Steps = append(r.state.Steps, &runnerv1.StepState{
 			Id: int64(i),
 		})
 	}
+}
+
+// resolveStep maps a "Main"-stage log entry to the StepState it belongs to.
+// Must be called with stateMu held.
+//
+// Steps below preSeededSteps are the caller job's own steps, known to Gitea
+// ahead of time, and are indexed directly by stepNumber. Steps at or beyond
+// that count come from a called (workflow_call) reusable workflow whose steps
+// are not known until runtime: a flat StepState is allocated per (jobID,
+// stepNumber) so each inner step is reported to Gitea and its logs attributed
+// correctly, without colliding when the reusable workflow has multiple jobs
+// that each restart stepNumber at 0.
+func (r *Reporter) resolveStep(entry *log.Entry, stepNumber int) *runnerv1.StepState {
+	if stepNumber < r.preSeededSteps {
+		return r.state.Steps[stepNumber]
+	}
+	// jobID disambiguates inner steps when a reusable workflow has multiple jobs
+	// that each restart stepNumber at 0. It is normally set by act's job logger;
+	// if it is ever missing, distinct jobs' steps would merge — warn once.
+	jobID, ok := entry.Data["jobID"].(string)
+	if !ok && !r.jobIDMissingLogged {
+		log.Warnf("reporter: missing jobID for reusable-workflow step %d; step attribution may collide", stepNumber)
+		r.jobIDMissingLogged = true
+	}
+	if r.dynStepIndex == nil {
+		r.dynStepIndex = make(map[string]int)
+	}
+	key := jobID + "\x00" + strconv.Itoa(stepNumber)
+	if idx, ok := r.dynStepIndex[key]; ok {
+		return r.state.Steps[idx]
+	}
+	// Bound dynamically-allocated steps so a runaway/buggy producer of distinct
+	// (jobID, stepNumber) pairs can't grow state.Steps without limit. Beyond the
+	// cap, fall back to job-level logging (return nil).
+	if len(r.dynStepIndex) >= maxDynamicSteps {
+		if !r.dynOverflowLogged {
+			log.Warnf("reporter: reusable-workflow step count exceeded %d; further step logs go to the job log", maxDynamicSteps)
+			r.dynOverflowLogged = true
+		}
+		return nil
+	}
+	name, _ := entry.Data["step"].(string)
+	idx := len(r.state.Steps)
+	r.state.Steps = append(r.state.Steps, &runnerv1.StepState{
+		Id:   int64(idx),
+		Name: name,
+	})
+	r.dynStepIndex[key] = idx
+	return r.state.Steps[idx]
 }
 
 func (r *Reporter) Levels() []log.Level {
@@ -222,8 +290,8 @@ func (r *Reporter) Fire(entry *log.Entry) error {
 
 	var step *runnerv1.StepState
 	if v, ok := entry.Data["stepNumber"]; ok {
-		if v, ok := v.(int); ok && len(r.state.Steps) > v {
-			step = r.state.Steps[v]
+		if stepNumber, ok := v.(int); ok {
+			step = r.resolveStep(entry, stepNumber)
 		}
 	}
 	if step == nil {

@@ -110,3 +110,5 @@ require (
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace gitea.dev/actions-proto-go => github.com/adambenhassen/actions-proto-go v0.6.2

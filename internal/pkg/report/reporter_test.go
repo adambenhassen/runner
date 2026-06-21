@@ -983,3 +983,120 @@ func TestReporter_StopHeartbeats(t *testing.T) {
 	assert.Greater(t, updateTaskCalls.Load(), beforeStop,
 		"Close() must still send a final UpdateTask after StopHeartbeats")
 }
+
+// TestReporter_ReusableWorkflowDynamicSteps verifies that steps belonging to a
+// called (workflow_call) reusable workflow are reported even though the caller
+// job has no steps of its own (ResetSteps(0)). Their step indexes must be flat
+// and gap-free, and must not collide when the reusable workflow contains more
+// than one job that each restart stepNumber at 0.
+func TestReporter_ReusableWorkflowDynamicSteps(t *testing.T) {
+	client := mocks.NewClient(t)
+	client.On("UpdateLog", mock.Anything, mock.Anything).Maybe().Return(
+		func(_ context.Context, req *connect_go.Request[runnerv1.UpdateLogRequest]) (*connect_go.Response[runnerv1.UpdateLogResponse], error) {
+			return connect_go.NewResponse(&runnerv1.UpdateLogResponse{
+				AckIndex: req.Msg.Index + int64(len(req.Msg.Rows)),
+			}), nil
+		})
+	client.On("UpdateTask", mock.Anything, mock.Anything).Maybe().Return(
+		func(_ context.Context, _ *connect_go.Request[runnerv1.UpdateTaskRequest]) (*connect_go.Response[runnerv1.UpdateTaskResponse], error) {
+			return connect_go.NewResponse(&runnerv1.UpdateTaskResponse{}), nil
+		})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	taskCtx, err := structpb.NewStruct(map[string]any{})
+	require.NoError(t, err)
+	cfg, _ := config.LoadDefault("")
+	reporter := NewReporter(ctx, cancel, client, &runnerv1.Task{Context: taskCtx}, cfg)
+
+	// A `uses:` caller job has no steps of its own.
+	reporter.ResetSteps(0)
+
+	fire := func(jobID string, stepNumber int, stepName, msg string) {
+		require.NoError(t, reporter.Fire(&log.Entry{
+			Message: msg,
+			Data:    log.Fields{"stage": "Main", "jobID": jobID, "stepNumber": stepNumber, "step": stepName, "raw_output": true},
+			Level:   log.InfoLevel,
+		}))
+	}
+
+	// Inner reusable-workflow job "build" with two steps.
+	fire("build", 0, "Run actions/checkout@v4", "checkout")
+	fire("build", 1, "Build", "compile")
+	// A second inner job "test" reuses stepNumber 0 — must not collide with build/0.
+	fire("test", 0, "Run tests", "run tests")
+
+	require.Len(t, reporter.state.Steps, 3,
+		"each inner reusable-workflow step must be reported as a distinct step")
+	wantNames := []string{"Run actions/checkout@v4", "Build", "Run tests"}
+	for i, s := range reporter.state.Steps {
+		assert.Equal(t, int64(i), s.Id, "step Id must be a flat, gap-free index")
+		assert.Equal(t, int64(1), s.LogLength, "each inner step must own its log line")
+		assert.Equal(t, wantNames[i], s.Name, "inner step name must be reported")
+	}
+	assert.Equal(t, reporter.state.Steps[0].LogIndex+1, reporter.state.Steps[1].LogIndex,
+		"inner step log indexes must be contiguous")
+}
+
+// newTestReporter builds a Reporter with no-op UpdateLog/UpdateTask mocks.
+func newTestReporter(t *testing.T) *Reporter {
+	t.Helper()
+	client := mocks.NewClient(t)
+	client.On("UpdateLog", mock.Anything, mock.Anything).Maybe().Return(
+		func(_ context.Context, req *connect_go.Request[runnerv1.UpdateLogRequest]) (*connect_go.Response[runnerv1.UpdateLogResponse], error) {
+			return connect_go.NewResponse(&runnerv1.UpdateLogResponse{AckIndex: req.Msg.Index + int64(len(req.Msg.Rows))}), nil
+		})
+	client.On("UpdateTask", mock.Anything, mock.Anything).Maybe().Return(
+		func(_ context.Context, _ *connect_go.Request[runnerv1.UpdateTaskRequest]) (*connect_go.Response[runnerv1.UpdateTaskResponse], error) {
+			return connect_go.NewResponse(&runnerv1.UpdateTaskResponse{}), nil
+		})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	taskCtx, err := structpb.NewStruct(map[string]any{})
+	require.NoError(t, err)
+	cfg, _ := config.LoadDefault("")
+	return NewReporter(ctx, cancel, client, &runnerv1.Task{Context: taskCtx}, cfg)
+}
+
+// TestReporter_NormalJobNoDynamicSteps verifies that an ordinary job (steps
+// known up front, ResetSteps(N>0)) never triggers the dynamic-step path: every
+// stepNumber maps directly to its pre-seeded slot and no extra steps appear.
+func TestReporter_NormalJobNoDynamicSteps(t *testing.T) {
+	reporter := newTestReporter(t)
+	reporter.ResetSteps(2)
+
+	for _, n := range []int{0, 1} {
+		require.NoError(t, reporter.Fire(&log.Entry{
+			Message: "out",
+			Data:    log.Fields{"stage": "Main", "jobID": "job", "stepNumber": n, "raw_output": true},
+			Level:   log.InfoLevel,
+		}))
+	}
+
+	require.Len(t, reporter.state.Steps, 2, "a normal job must not allocate dynamic steps")
+	assert.Empty(t, reporter.dynStepIndex, "dynStepIndex must stay empty for normal jobs")
+	assert.Equal(t, int64(1), reporter.state.Steps[0].LogLength)
+	assert.Equal(t, int64(1), reporter.state.Steps[1].LogLength)
+}
+
+// TestReporter_DynamicStepEmptyName verifies that when no step name is present
+// the reported step name is left empty (Gitea then applies its "Step N"
+// fallback), and that re-firing the same (jobID, stepNumber) reuses the step.
+func TestReporter_DynamicStepEmptyName(t *testing.T) {
+	reporter := newTestReporter(t)
+	reporter.ResetSteps(0)
+
+	fire := func() {
+		require.NoError(t, reporter.Fire(&log.Entry{
+			Message: "out",
+			Data:    log.Fields{"stage": "Main", "jobID": "child", "stepNumber": 0, "raw_output": true},
+			Level:   log.InfoLevel,
+		}))
+	}
+	fire()
+	fire() // same (jobID, stepNumber): must not allocate a second step
+
+	require.Len(t, reporter.state.Steps, 1, "re-firing the same step must reuse it")
+	assert.Empty(t, reporter.state.Steps[0].Name, "missing step name must be reported as empty")
+	assert.Equal(t, int64(2), reporter.state.Steps[0].LogLength)
+}
