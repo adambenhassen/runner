@@ -32,3 +32,12 @@ func WithJobErrorContainer(ctx context.Context) context.Context {
 	container := map[string]error{}
 	return context.WithValue(ctx, jobErrorContextKeyVal, container)
 }
+
+// WithJobErrorContainerFrom returns dst carrying the job error container of src, if any,
+// so a context derived from context.Background() keeps seeing (and setting) the job error.
+func WithJobErrorContainerFrom(dst, src context.Context) context.Context {
+	if val := src.Value(jobErrorContextKeyVal); val != nil {
+		return context.WithValue(dst, jobErrorContextKeyVal, val)
+	}
+	return dst
+}

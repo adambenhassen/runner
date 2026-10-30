@@ -691,6 +691,13 @@ func (cr *containerReference) exec(cmd []string, env map[string]string, user, wo
 			return fmt.Errorf("failed to inspect exec: %w", err)
 		}
 
+		// The API reports no exit code while the process runs and the client maps that to 0.
+		// If the attach stream ended with the exec still running, the container or daemon went
+		// away mid-command: that is a failure, not a success.
+		if inspectResp.Running {
+			return fmt.Errorf("command output stream ended while the process was still running (container or Docker daemon lost): %v", cmd)
+		}
+
 		if inspectResp.ExitCode == 0 {
 			return nil
 		}

@@ -207,7 +207,9 @@ func newJobExecutor(info jobInfo, sf stepFactory, rc *RunContext) common.Executo
 			if ctx.Err() == context.Canceled {
 				// in case of an aborted run, we still should execute the
 				// post steps to allow cleanup.
-				ctx, cancel = context.WithTimeout(common.WithLogger(context.Background(), common.Logger(ctx)), 5*time.Minute)
+				// Carry the job error container over: a fresh Background context would lose
+				// it, and an aborted job (e.g. a lost container) would be reported as success.
+				ctx, cancel = context.WithTimeout(common.WithLogger(common.WithJobErrorContainerFrom(context.Background(), ctx), common.Logger(ctx)), 5*time.Minute)
 				defer cancel()
 			}
 			return postExecutor(ctx)

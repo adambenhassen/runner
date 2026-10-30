@@ -347,6 +347,49 @@ func TestNewJobExecutor(t *testing.T) {
 	}
 }
 
+// TestJobExecutorAbortedMidStepFails verifies a job whose context is cancelled while a step runs
+// (a lost container, a runner shutdown) is reported as failed and never as success.
+func TestJobExecutorAbortedMidStepFails(t *testing.T) {
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := common.WithJobErrorContainer(base)
+
+	jim := &jobInfoMock{}
+	sfm := &stepFactoryMock{}
+	rc := &RunContext{
+		JobContainer: &jobContainerMock{},
+		Run: &model.Run{
+			JobID:    "test",
+			Workflow: &model.Workflow{Jobs: map[string]*model.Job{"test": {}}},
+		},
+		Config: &Config{},
+	}
+	rc.ExprEval = rc.NewExpressionEvaluator(ctx)
+
+	stepModel := &model.Step{ID: "1"}
+	sm := &stepMock{}
+	sfm.On("newStep", stepModel, rc).Return(sm, nil)
+	sm.On("pre").Return(func(context.Context) error { return nil })
+	sm.On("post").Return(func(context.Context) error { return nil })
+	sm.On("main").Return(func(ctx context.Context) error {
+		cancel()
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	jim.On("steps").Return([]*model.Step{stepModel})
+	jim.On("matrix").Return(map[string]any{})
+	jim.On("startContainer").Return(func(context.Context) error { return nil })
+	jim.On("stopContainer").Return(func(context.Context) error { return nil })
+	jim.On("closeContainer").Return(func(context.Context) error { return nil })
+	jim.On("interpolateOutputs").Return(func(context.Context) error { return nil })
+	jim.On("result", mock.Anything)
+
+	require.NoError(t, newJobExecutor(jim, sfm, rc)(ctx))
+	jim.AssertCalled(t, "result", "failure")
+	jim.AssertNotCalled(t, "result", "success")
+}
+
 func TestHasJobSummaryCapability(t *testing.T) {
 	assert.True(t, hasJobSummaryCapability("cache,job-summary artifacts"))
 	assert.True(t, hasJobSummaryCapability("cache,\njob-summary\tartifacts"))

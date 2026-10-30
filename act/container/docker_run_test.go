@@ -213,6 +213,45 @@ func TestDockerExecFailure(t *testing.T) {
 	client.AssertExpectations(t)
 }
 
+// TestDockerExecStreamEndedWhileRunning covers the container or daemon going away mid-command:
+// the attach stream ends but the daemon still reports the exec as running, with no exit code
+// (which the client surfaces as 0). That must not be treated as success.
+func TestDockerExecStreamEndedWhileRunning(t *testing.T) {
+	ctx := context.Background()
+
+	conn := &mockConn{}
+
+	client := &mockDockerClient{}
+	client.On("ExecCreate", ctx, "123", mock.AnythingOfType("client.ExecCreateOptions")).Return(mobyclient.ExecCreateResult{ID: "id"}, nil)
+	client.On("ExecAttach", ctx, "id", mock.AnythingOfType("client.ExecAttachOptions")).Return(mobyclient.ExecAttachResult{
+		HijackedResponse: mobyclient.HijackedResponse{
+			Conn:   conn,
+			Reader: bufio.NewReader(strings.NewReader("")),
+		},
+	}, nil)
+	client.On("ExecInspect", ctx, "id", mobyclient.ExecInspectOptions{}).Return(mobyclient.ExecInspectResult{
+		Running:  true,
+		ExitCode: 0,
+	}, nil)
+
+	cr := &containerReference{
+		id:  "123",
+		cli: client,
+		input: &NewContainerInput{
+			Image: "image",
+		},
+	}
+
+	err := cr.exec([]string{"sleep", "60"}, map[string]string{}, "user", "workdir")(ctx)
+	require.Error(t, err)
+	var exitErr ExitCodeError
+	assert.NotErrorAs(t, err, &exitErr)
+	assert.Contains(t, err.Error(), "still running")
+
+	conn.AssertExpectations(t)
+	client.AssertExpectations(t)
+}
+
 // stdcopyFrame wraps payload in a single Docker multiplexed-stream frame, the
 // format StdCopy expects: an 8-byte header (stream type + 4-byte big-endian
 // length) followed by the payload.
